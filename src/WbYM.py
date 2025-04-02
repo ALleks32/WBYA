@@ -3,6 +3,9 @@ from typing import Optional
 import logging
 import requests
 
+# Добавляем openpyxl, чтобы сохранять структуру Excel и обновлять только нужные ячейки
+from openpyxl import load_workbook
+
 logger = logging.getLogger(__name__)
 
 class WbYMProcessor:
@@ -36,7 +39,6 @@ class WbYMProcessor:
 
     def read_ym_data(self, sheet_name: str = "YM") -> Optional[pd.DataFrame]:
         """Читает лист 'YM' и сохраняет в self._df_ym."""
-        # Для упрощения демонстрации, возьмём только нужные колонки
         required_columns = ['last_id', 'last_name']
         try:
             df = pd.read_excel(self.file_path, sheet_name=sheet_name)
@@ -81,7 +83,6 @@ class WbYMProcessor:
             logger.debug(f"API WB вернул пустой список products для '{name_product}'.")
             return None
 
-        # Берём первый товар из списка
         product = products[0]
         subject_id = product.get("subjectId")
         if subject_id is not None:
@@ -92,43 +93,88 @@ class WbYMProcessor:
             logger.debug(f"Для '{name_product}' subjectId отсутствует, возвращаем parentId: {parent_id}")
             return parent_id
 
-    def update_wb_with_ym(self) -> None:
+    def update_wb_with_ym(self, chunk_size: int = 100) -> None:
         """
-        Проходим по строкам листа YM:
+        Проходим по строкам листа YM батчами по chunk_size:
         - Для каждого last_name получаем subject_id из API;
-        - Ищем в WB строку с таким subject_id;
-        - Проставляем в её YM_id значение last_id из YM.
+        - Ищем в WB строки с таким subject_id;
+        - Проставляем в их YM_id значение last_id из YM;
+        - После обработки каждого батча (100 записей), сохраняем обновлённый YM_id обратно в Excel,
+          не ломая структуру таблицы, обновляем только колонку 'YM_id'.
         """
         if self._df_wb is None or self._df_ym is None:
             logger.error("Сначала нужно считать данные из обоих листов (WB и YM).")
             return
 
         updated_count = 0
-        for idx, row in self._df_ym.iterrows():
-            last_name = row['last_name']
-            last_id = row['last_id']
+        total_rows = len(self._df_ym)
 
-            subject_id = self.get_subject_id(last_name)
-            if subject_id is not None:
-                # Обновляем колонку YM_id в WB для найденного subject_id
-                mask = self._df_wb['subject_id'] == subject_id
-                if mask.any():
-                    self._df_wb.loc[mask, 'YM_id'] = last_id
-                    logger.info(
-                        f"[{idx}] Для last_name='{last_name}' найден subject_id={subject_id}. "
-                        f"Установлен YM_id={last_id}"
-                    )
-                    updated_count += mask.sum()  # Сколько строк обновлено
+        # Делим self._df_ym на куски по chunk_size
+        for start in range(0, total_rows, chunk_size):
+            end = start + chunk_size
+            chunk = self._df_ym.iloc[start:end]
+
+            # Обновляем данные в self._df_wb (только в памяти)
+            for idx, row in chunk.iterrows():
+                last_name = row['last_name']
+                last_id = row['last_id']
+
+                subject_id = self.get_subject_id(last_name)
+                if subject_id is not None:
+                    mask = self._df_wb['subject_id'] == subject_id
+                    if mask.any():
+                        self._df_wb.loc[mask, 'YM_id'] = last_id
+                        logger.info(
+                            f"[{idx}] Для last_name='{last_name}' найден subject_id={subject_id}. "
+                            f"Установлен YM_id={last_id}"
+                        )
+                        updated_count += mask.sum()
+                    else:
+                        logger.warning(
+                            f"[{idx}] subject_id={subject_id} из API не найден в листе WB."
+                        )
                 else:
                     logger.warning(
-                        f"[{idx}] subject_id={subject_id} из API не найден в листе WB."
+                        f"[{idx}] Не найден subject_id для last_name='{last_name}' (API вернул пустой результат)."
                     )
-            else:
-                logger.warning(
-                    f"[{idx}] Не найден subject_id для last_name='{last_name}' (API вернул пустой результат)."
-                )
 
-        logger.info(f"update_wb_with_ym завершён. Обновлено строк: {updated_count}.")
+            # Каждый обработанный батч (100 записей) сразу сохраняем в Excel
+            self._save_updated_ym_id_to_excel()
+            logger.info(f"Обработано записей: {end if end < total_rows else total_rows} / {total_rows}")
+
+        logger.info(f"update_wb_with_ym завершён. Всего обновлено строк: {updated_count}.")
+
+    def _save_updated_ym_id_to_excel(self, sheet_name: str = "WB") -> None:
+        """
+        Сохраняет текущие значения YM_id из self._df_wb обратно в Excel,
+        не трогая структуру листа и другие столбцы.
+        """
+        if self._df_wb is None:
+            logger.error("Нет данных в self._df_wb для сохранения.")
+            return
+
+        try:
+            # Загружаем существующую книгу
+            wb = load_workbook(self.file_path)
+            ws = wb[sheet_name]
+
+            # Считываем заголовки, чтобы найти индекс столбца YM_id
+            headers = [cell.value for cell in ws[1]]
+            if 'YM_id' not in headers:
+                logger.error(f"Не найден столбец 'YM_id' в листе '{sheet_name}'.")
+                return
+            ym_id_col_idx = headers.index('YM_id') + 1  # +1 из-за 1-базовой индексации в Excel
+
+            # Перебираем строки DataFrame и обновляем только YM_id
+            for i, row_data in self._df_wb.iterrows():
+                # В Excel строки начинаются с 1, первая строка — заголовки
+                excel_row = i + 2
+                ws.cell(row=excel_row, column=ym_id_col_idx).value = row_data['YM_id']
+
+            wb.save(self.file_path)
+            logger.info(f"Данные YM_id успешно сохранены в лист '{sheet_name}'.")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении YM_id в Excel: {e}")
 
     @property
     def wb_data(self) -> Optional[pd.DataFrame]:
