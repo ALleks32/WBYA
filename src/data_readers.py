@@ -6,10 +6,7 @@ from src.logger import logger
 
 
 class WbYMReader:
-    """
-    Класс для чтения файла wb-ym.xlsx с указанного листа.
-    Ожидаемые колонки: 'parent_name', 'subject_name', 'YM_id'.
-    """
+
     def __init__(self, file_path: str):
         self.file_path = file_path
         self._df = None
