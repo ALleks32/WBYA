@@ -1,12 +1,9 @@
 import pandas as pd
 from typing import Optional
-import logging
+from src.logger import logger
 import requests
-
-# Добавляем openpyxl, чтобы сохранять структуру Excel и обновлять только нужные ячейки
 from openpyxl import load_workbook
-
-logger = logging.getLogger(__name__)
+from src.wb_api import get_subject_id
 
 class WbYMProcessor:
     def __init__(self, file_path: str):
@@ -60,38 +57,7 @@ class WbYMProcessor:
         logger.info(f"YM-данные успешно сохранены. Итоговая форма: {self._df_ym.shape}")
         return self._df_ym
 
-    def get_subject_id(self, name_product: str) -> Optional[int]:
-        """
-        Делает запрос к API Wildberries, чтобы получить subject_id.
-        Если subject_id отсутствует, возвращаем subjectParentId.
-        """
-        url = (
-            "https://search.wb.ru/exactmatch/ru/common/v9/"
-            f"search?appType=1&curr=page=1&query={name_product}&resultset=catalog"
-        )
-        logger.debug(f"Запрос к WB API: {url}")
-        try:
-            response = requests.get(url)
-            response.raise_for_status()
-            data = response.json()
-        except requests.RequestException as e:
-            logger.error(f"Ошибка при запросе к API Wildberries для '{name_product}': {e}")
-            return None
 
-        products = data.get("data", {}).get("products", [])
-        if not products:
-            logger.debug(f"API WB вернул пустой список products для '{name_product}'.")
-            return None
-
-        product = products[0]
-        subject_id = product.get("subjectId")
-        if subject_id is not None:
-            logger.debug(f"Для '{name_product}' получен subjectId: {subject_id}")
-            return subject_id
-        else:
-            parent_id = product.get("subjectParentId")
-            logger.debug(f"Для '{name_product}' subjectId отсутствует, возвращаем parentId: {parent_id}")
-            return parent_id
 
     def update_wb_with_ym(self, chunk_size: int = 100) -> None:
         """
@@ -99,12 +65,17 @@ class WbYMProcessor:
         - Для каждого last_name получаем subject_id из API;
         - Ищем в WB строки с таким subject_id;
         - Проставляем в их YM_id значение last_id из YM;
-        - После обработки каждого батча (100 записей), сохраняем обновлённый YM_id обратно в Excel,
-          не ломая структуру таблицы, обновляем только колонку 'YM_id'.
+        - Одновременно создаём/обновляем в WB и колонку YM_name тем же last_name.
+        - После обработки каждого батча (100 записей), сохраняем обновления обратно в Excel,
+          не ломая структуру таблицы (обновляем только нужные колонки).
         """
         if self._df_wb is None or self._df_ym is None:
             logger.error("Сначала нужно считать данные из обоих листов (WB и YM).")
             return
+
+        # Если в DF WB ещё нет колонки YM_name, создадим пустую
+        if 'YM_name' not in self._df_wb.columns:
+            self._df_wb['YM_name'] = None
 
         updated_count = 0
         total_rows = len(self._df_ym)
@@ -119,14 +90,15 @@ class WbYMProcessor:
                 last_name = row['last_name']
                 last_id = row['last_id']
 
-                subject_id = self.get_subject_id(last_name)
+                subject_id = get_subject_id(last_name)
                 if subject_id is not None:
                     mask = self._df_wb['subject_id'] == subject_id
                     if mask.any():
                         self._df_wb.loc[mask, 'YM_id'] = last_id
+                        self._df_wb.loc[mask, 'YM_name'] = last_name  # <-- Записываем название категории
                         logger.info(
                             f"[{idx}] Для last_name='{last_name}' найден subject_id={subject_id}. "
-                            f"Установлен YM_id={last_id}"
+                            f"Установлен YM_id={last_id}, YM_name='{last_name}'"
                         )
                         updated_count += mask.sum()
                     else:
@@ -138,43 +110,62 @@ class WbYMProcessor:
                         f"[{idx}] Не найден subject_id для last_name='{last_name}' (API вернул пустой результат)."
                     )
 
-            # Каждый обработанный батч (100 записей) сразу сохраняем в Excel
-            self._save_updated_ym_id_to_excel()
+            # Каждый обработанный батч сразу сохраняем в Excel
+            self._save_updated_ym_data_to_excel()
             logger.info(f"Обработано записей: {end if end < total_rows else total_rows} / {total_rows}")
 
         logger.info(f"update_wb_with_ym завершён. Всего обновлено строк: {updated_count}.")
 
-    def _save_updated_ym_id_to_excel(self, sheet_name: str = "WB") -> None:
+    def _save_updated_ym_data_to_excel(self, sheet_name: str = "WB") -> None:
         """
-        Сохраняет текущие значения YM_id из self._df_wb обратно в Excel,
+        Сохраняет текущие значения YM_id и YM_name из self._df_wb обратно в Excel,
         не трогая структуру листа и другие столбцы.
+        Если столбца YM_name нет в самом Excel, добавляем его рядом с YM_id.
         """
         if self._df_wb is None:
             logger.error("Нет данных в self._df_wb для сохранения.")
             return
 
         try:
-            # Загружаем существующую книгу
             wb = load_workbook(self.file_path)
             ws = wb[sheet_name]
 
-            # Считываем заголовки, чтобы найти индекс столбца YM_id
+            # Читаем заголовки
             headers = [cell.value for cell in ws[1]]
+            # Проверяем наличие YM_id
             if 'YM_id' not in headers:
                 logger.error(f"Не найден столбец 'YM_id' в листе '{sheet_name}'.")
                 return
-            ym_id_col_idx = headers.index('YM_id') + 1  # +1 из-за 1-базовой индексации в Excel
 
-            # Перебираем строки DataFrame и обновляем только YM_id
+            ym_id_col_idx = headers.index('YM_id') + 1
+
+            # Проверяем наличие YM_name
+            if 'YM_name' not in headers:
+                # Вставляем новый столбец сразу после 'YM_id'
+                new_col_index = ym_id_col_idx + 1
+                ws.insert_cols(new_col_index)
+                # Подпишем заголовок новой колонки
+                ws.cell(row=1, column=new_col_index, value='YM_name')
+
+                # Нужно обновить headers, иначе ниже будем искать по старому списку
+                headers.insert(new_col_index - 1, 'YM_name')
+
+            ym_name_col_idx = headers.index('YM_name') + 1
+
+            # Теперь проставляем значения YM_id и YM_name по строкам
             for i, row_data in self._df_wb.iterrows():
                 # В Excel строки начинаются с 1, первая строка — заголовки
                 excel_row = i + 2
+
+                # Обновляем YM_id
                 ws.cell(row=excel_row, column=ym_id_col_idx).value = row_data['YM_id']
+                # Обновляем YM_name
+                ws.cell(row=excel_row, column=ym_name_col_idx).value = row_data['YM_name']
 
             wb.save(self.file_path)
-            logger.info(f"Данные YM_id успешно сохранены в лист '{sheet_name}'.")
+            logger.info(f"Данные YM_id и YM_name успешно сохранены в лист '{sheet_name}'.")
         except Exception as e:
-            logger.error(f"Ошибка при сохранении YM_id в Excel: {e}")
+            logger.error(f"Ошибка при сохранении YM_id/YM_name в Excel: {e}")
 
     @property
     def wb_data(self) -> Optional[pd.DataFrame]:
