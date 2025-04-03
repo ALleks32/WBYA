@@ -1,94 +1,66 @@
-
 import pandas as pd
-from pathlib import Path
 from typing import Optional
 from src.logger import logger
 
 
 class WbYMReader:
-
     def __init__(self, file_path: str):
         self.file_path = file_path
-        self._df = None
+        self._df_wb: Optional[pd.DataFrame] = None
+        self._df_ym: Optional[pd.DataFrame] = None
 
-    def read_data(self, sheet_name: str = "WB") -> Optional[pd.DataFrame]:
+    def read_wb_data(self, sheet_name: str = "WB") -> Optional[pd.DataFrame]:
+        """Читает лист 'WB' и сохраняет в self._df_wb."""
+        required_columns = ['parent_id', 'parent_name', 'subject_id', 'subject_name', 'YM_id']
         try:
             df = pd.read_excel(self.file_path, sheet_name=sheet_name)
             logger.info(f"Файл '{self.file_path}' успешно прочитан (лист '{sheet_name}').")
+            logger.debug(f"Прочитано строк: {df.shape[0]}, столбцов: {df.shape[1]}")
         except Exception as e:
             logger.error(f"Ошибка чтения файла '{self.file_path}' (лист '{sheet_name}'): {e}")
             return None
 
-        required_columns = ['parent_id', 'parent_name','subject_id', 'subject_name', 'YM_id']
+        # Проверяем наличие нужных колонок
         missing_columns = [col for col in required_columns if col not in df.columns]
         if missing_columns:
-            logger.error(f"В файле wb-ym отсутствуют следующие колонки: {', '.join(missing_columns)}")
+            logger.error(
+                f"В листе '{sheet_name}' отсутствуют колонки: {', '.join(missing_columns)}"
+            )
             return None
 
-        self._df = df[required_columns]
-        return self._df
+        self._df_wb = df[required_columns].copy()
+        logger.info(f"WB-данные успешно сохранены. Итоговая форма: {self._df_wb.shape}")
+        return self._df_wb
+
+    def read_ym_data(self, sheet_name: str = "YM") -> Optional[pd.DataFrame]:
+        """Читает лист 'YM' и сохраняет в self._df_ym."""
+        required_columns = ['last_id', 'last_name']
+        try:
+            df = pd.read_excel(self.file_path, sheet_name=sheet_name)
+            logger.info(f"Файл '{self.file_path}' успешно прочитан (лист '{sheet_name}').")
+            logger.debug(f"Прочитано строк: {df.shape[0]}, столбцов: {df.shape[1]}")
+        except Exception as e:
+            logger.error(f"Ошибка чтения файла '{self.file_path}' (лист '{sheet_name}'): {e}")
+            return None
+
+        # Аналогичная проверка наличия необходимых колонок
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            logger.error(
+                f"В листе '{sheet_name}' отсутствуют колонки: {', '.join(missing_columns)}"
+            )
+            return None
+
+        self._df_ym = df[required_columns].copy()
+        logger.info(f"YM-данные успешно сохранены. Итоговая форма: {self._df_ym.shape}")
+        return self._df_ym
 
     @property
-    def data(self) -> Optional[pd.DataFrame]:
-        return self._df
-
-
-
-class CabinetTableReader:
-    """
-    Класс для чтения файлов с таблицами кабинетов из указанной папки.
-    Ожидаемые колонки: 'Категория_YMname', 'Категория_YMid'.
-    Данные из всех файлов объединяются в один DataFrame.
-    """
-    def __init__(self, folder_path: str):
-        self.folder_path = folder_path
-        self._df = None
-
-    def read_data(self) -> Optional[pd.DataFrame]:
-        folder = Path(self.folder_path)
-        if not folder.exists() or not folder.is_dir():
-            logger.error(f"Папка '{self.folder_path}' не найдена или не является директорией.")
-            return None
-
-        dfs = []
-        for file in folder.iterdir():
-            if file.suffix.lower() in [".xlsx", ".xls"]:
-                try:
-                    df = pd.read_excel(file)
-                    logger.info(f"Файл '{file}' успешно прочитан (Excel).")
-                except Exception as e:
-                    logger.error(f"Ошибка чтения файла '{file}': {e}")
-                    continue
-            elif file.suffix.lower() == ".csv":
-                try:
-                    df = pd.read_csv(file, delimiter=";", encoding="utf-8", on_bad_lines="skip")
-                    logger.info(f"Файл '{file}' успешно прочитан (CSV).")
-                except Exception as e:
-                    logger.error(f"Ошибка чтения файла '{file}': {e}")
-                    continue
-            else:
-                logger.warning(f"Файл '{file}' имеет неподдерживаемый формат и пропущен.")
-                continue
-
-            required_columns = ['Категория_YMname', 'Категория_YMid']
-            missing_columns = [col for col in required_columns if col not in df.columns]
-            if missing_columns:
-                logger.error(f"В файле '{file}' отсутствуют следующие колонки: {', '.join(missing_columns)}")
-                continue
-
-            dfs.append(df[required_columns])
-
-        if not dfs:
-            logger.error("Не удалось прочитать ни одного файла с корректными данными из папки.")
-            return None
-
-        combined_df = pd.concat(dfs, ignore_index=True)
-        self._df = combined_df
-        logger.info(f"Объединено {len(dfs)} файлов, итоговое число строк: {len(combined_df)}.")
-        return self._df
+    def wb_data(self) -> Optional[pd.DataFrame]:
+        """Возвращает текущую копию данных из листа WB."""
+        return self._df_wb
 
     @property
-    def data(self) -> Optional[pd.DataFrame]:
-        return self._df
-
-
+    def ym_data(self) -> Optional[pd.DataFrame]:
+        """Возвращает текущую копию данных из листа YM."""
+        return self._df_ym
